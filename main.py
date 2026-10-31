@@ -25,6 +25,7 @@ app.mount("/files", StaticFiles(directory=str(DOWNLOADS)), name="files")
 pyro_client = None
 call_client = None
 call_start_error = None
+call_handler_error = None
 active_sessions: dict[int, dict] = {}
 
 try:
@@ -102,14 +103,74 @@ class CallControlRequest(BaseModel):
     seconds: Optional[int] = None
 
 
-async def post_callback(url: str, payload: dict) -> None:
+async def post_callback(url: str, payload: dict) -> bool:
     headers = {"Authorization": f"Bearer {SECRET}"} if SECRET else {}
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
             response = await client.post(url, json=payload, headers=headers)
             response.raise_for_status()
+        return True
     except Exception as exc:
         print(f"Callback failed: {type(exc).__name__}: {str(exc)[:250]}")
+        return False
+
+
+async def auto_delete_file(file_path: str, delay_seconds: int = 180) -> None:
+    """Delete served downloads after the bot has had time to fetch them."""
+    await asyncio.sleep(max(60, delay_seconds))
+    try:
+        path = Path(file_path)
+        if path.exists() and path.is_file():
+            path.unlink()
+            print(f"Cleaned up download: {path.name}")
+    except Exception as exc:
+        print(f"Could not clean download {file_path}: {type(exc).__name__}: {str(exc)[:200]}")
+
+
+def cleanup_job_files(job_id: str) -> None:
+    for path in DOWNLOADS.glob(f"{job_id}.*"):
+        try:
+            if path.is_file():
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"Could not remove partial download {path.name}: {exc}")
+
+
+# PyTgCalls 2.2.x emits separate audio/video end updates.
+if call_client:
+    try:
+        from pytgcalls.types import Update
+        from pytgcalls.types.stream import StreamAudioEnded, StreamVideoEnded
+
+        @call_client.on_update()
+        async def on_stream_end(_, update: Update):
+            if not isinstance(update, (StreamAudioEnded, StreamVideoEnded)):
+                return
+
+            chat_id = update.chat_id
+            session = active_sessions.get(chat_id)
+            if not session or session.get("ending"):
+                return
+
+            # Prevent duplicate end updates from advancing the queue twice.
+            session["ending"] = True
+            session_id = session.get("session_id")
+            if CALLBACK_BASE and session_id:
+                callback_url = f"{CALLBACK_BASE}/api/public/render/callback"
+                await post_callback(
+                    callback_url,
+                    {"type": "track_ended", "session_id": session_id},
+                )
+            else:
+                print("track_ended not sent: BOT_CALLBACK_BASE_URL or session_id is missing")
+
+            # Do not remove a newer track started while the callback was running.
+            if active_sessions.get(chat_id) is session:
+                active_sessions.pop(chat_id, None)
+
+    except Exception as exc:
+        call_handler_error = f"{type(exc).__name__}: {str(exc)[:220]}"
+        print(f"Stream-end handler unavailable: {call_handler_error}")
 
 
 def _download(url: str, fmt: str, job_id: str) -> tuple[str, str]:
@@ -163,17 +224,23 @@ def _download(url: str, fmt: str, job_id: str) -> tuple[str, str]:
 async def process_download(req: DownloadRequest) -> None:
     job_id = uuid.uuid4().hex[:16]
     status, title, file_url, error = "failed", "Media", None, None
+    file_path = None
     try:
-        path, title = await asyncio.to_thread(_download, str(req.url), req.format, job_id)
-        size = Path(path).stat().st_size
+        file_path, title = await asyncio.to_thread(
+            _download, str(req.url), req.format, job_id
+        )
+        size = Path(file_path).stat().st_size
         if size > 50 * 1024 * 1024:
-            raise RuntimeError("Output exceeds the 50 MB bot upload target")
+            raise RuntimeError("حجم الملف يتجاوز الحد الأقصى المستهدف للبوت (50 ميجابايت)")
         if not PUBLIC_URL:
-            raise RuntimeError("RENDER_SERVER_URL is not configured")
+            raise RuntimeError("RENDER_SERVER_URL غير مضبوط في متغيرات البيئة")
         status = "done"
-        file_url = f"{PUBLIC_URL}/files/{Path(path).name}"
+        file_url = f"{PUBLIC_URL}/files/{Path(file_path).name}"
     except Exception as exc:
         error = f"{type(exc).__name__}: {str(exc)[:350]}"
+        cleanup_job_files(job_id)
+        file_path = None
+
     await post_callback(str(req.callback_url), {
         "type": "download",
         "download_id": req.download_id,
@@ -183,6 +250,10 @@ async def process_download(req: DownloadRequest) -> None:
         "file_url": file_url,
         "error": error,
     })
+
+    # Begin the TTL after callback delivery so the bot has time to fetch the file.
+    if status == "done" and file_path:
+        asyncio.create_task(auto_delete_file(file_path, 180))
 
 
 @app.get("/")
@@ -196,7 +267,9 @@ async def health():
         "status": "ok",
         "downloads_dir_writable": os.access(DOWNLOADS, os.W_OK),
         "call_client_configured": call_client is not None,
-        "call_client_error": call_start_error,
+        "call_client_started": call_client is not None and call_start_error is None,
+        "stream_end_handler_configured": call_client is not None and call_handler_error is None,
+        "call_client_error": call_start_error or call_handler_error,
     }
 
 
@@ -212,35 +285,87 @@ async def download_endpoint(
 
 
 def require_calls() -> None:
-    if not call_client:
-        raise HTTPException(
-            status_code=503,
-            detail="Group-call playback is not configured. Set TELEGRAM_API_ID, TELEGRAM_API_HASH and TELEGRAM_SESSION_STRING.",
+    if not call_client or call_start_error or call_handler_error:
+        detail = call_start_error or call_handler_error or (
+            "خدمة المكالمات غير مهيأة. تأكد من TELEGRAM_API_ID و TELEGRAM_API_HASH و TELEGRAM_SESSION_STRING."
         )
+        raise HTTPException(status_code=503, detail=detail)
+
+
+async def ensure_assistant_joined(chat_id: int) -> None:
+    if not pyro_client:
+        raise HTTPException(status_code=503, detail="جلسة الحساب المساعد غير مهيأة على السيرفر.")
+    try:
+        await pyro_client.join_chat(chat_id)
+    except Exception as exc:
+        error_name = type(exc).__name__.upper()
+        error_text = str(exc).upper()
+        combined = f"{error_name} {error_text}"
+
+        if "USER_ALREADY_PARTICIPANT" in combined or "USERALREADYPARTICIPANT" in combined:
+            return
+        if "USER_BANNED_IN_CHANNEL" in combined or "USERBANNEDINCHANNEL" in combined:
+            raise HTTPException(
+                status_code=403,
+                detail="الحساب المساعد محظور في هذه المجموعة/القناة. أزل الحظر عنه أولاً.",
+            ) from exc
+        if "CHAT_ADMIN_REQUIRED" in combined or "CHATADMINREQUIRED" in combined:
+            raise HTTPException(
+                status_code=403,
+                detail="تعذّر انضمام الحساب المساعد. تحقق من صلاحيات المجموعة وأضف الحساب إليها.",
+            ) from exc
+        if "CHANNEL_PRIVATE" in combined or "CHANNELPRIVATE" in combined:
+            raise HTTPException(
+                status_code=403,
+                detail="المجموعة/القناة خاصة ولا يستطيع الحساب المساعد الوصول إليها. أضفه يدوياً أو زوّد البوت برابط دعوة صالح.",
+            ) from exc
+        raise HTTPException(
+            status_code=403,
+            detail=f"تعذّر إدخال الحساب المساعد إلى المجموعة: {type(exc).__name__}: {str(exc)[:180]}",
+        ) from exc
 
 
 @app.post("/call/play")
 async def call_play(req: CallPlayRequest, authorization: Optional[str] = Header(None)):
     require_auth(authorization)
     require_calls()
+    await ensure_assistant_joined(req.chat_id)
+
     try:
         def resolve_stream():
-            opts = {"format": "bestaudio/best" if req.mode == "audio" else "best[height<=720]/best", "quiet": True, "noplaylist": True}
+            opts = {
+                "format": "bestaudio/best" if req.mode == "audio" else "best[height<=720]/best",
+                "quiet": True,
+                "noplaylist": True,
+            }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(str(req.url), download=False)
                 return info.get("url") or str(req.url)
+
         stream_url = await asyncio.to_thread(resolve_stream)
         from pytgcalls.types import MediaStream, AudioQuality
         kwargs = {"media_path": stream_url, "audio_parameters": AudioQuality.HIGH}
         if req.mode == "audio":
             kwargs["video_flags"] = MediaStream.Flags.IGNORE
+
         await call_client.play(req.chat_id, MediaStream(**kwargs))
-        active_sessions[req.chat_id] = {"session_id": req.session_id, "mode": req.mode, "started": True}
-        return {"ok": True, "chat_id": req.chat_id}
+        active_sessions[req.chat_id] = {
+            "session_id": req.session_id,
+            "mode": req.mode,
+            "started": True,
+            "ending": False,
+        }
+        return {"ok": True, "chat_id": req.chat_id, "session_id": req.session_id}
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Playback failed: {str(exc)[:300]}")
+        err_text = f"{type(exc).__name__}: {str(exc)}"
+        if "NoActiveGroupCall" in err_text or "GROUPCALL_INVALID" in err_text:
+            raise HTTPException(
+                status_code=400,
+                detail="المكالمة الصوتية غير مفتوحة في المجموعة، يرجى فتح المكالمة أولاً.",
+            ) from exc
+        raise HTTPException(status_code=502, detail=f"فشل تشغيل البث: {err_text[:300]}") from exc
 
 
 @app.post("/call/pause")
