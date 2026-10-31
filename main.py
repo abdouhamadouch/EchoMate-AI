@@ -394,13 +394,12 @@ async def call_resume(req: CallControlRequest, authorization: Optional[str] = He
 async def call_stop(req: CallControlRequest, authorization: Optional[str] = Header(None)):
     require_auth(authorization)
     require_calls()
+    # Remove first so a manual stop cannot be mistaken for a natural track end.
+    active_sessions.pop(req.chat_id, None)
     try:
         await call_client.leave_call(req.chat_id)
     except Exception as exc:
-        # Don't conceal a real failure, but clear local tracking.
-        active_sessions.pop(req.chat_id, None)
         raise HTTPException(status_code=502, detail=str(exc)[:300])
-    active_sessions.pop(req.chat_id, None)
     return {"ok": True}
 
 
