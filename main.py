@@ -29,9 +29,15 @@ call_handler_error = None
 active_sessions: dict[int, dict] = {}
 
 try:
-    api_id_raw = os.getenv("TELEGRAM_API_ID", "").strip()
-    api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
-    session_string = os.getenv("TELEGRAM_SESSION_STRING", "").strip()
+    # Accept both the documented TELEGRAM_* names and the shorter aliases
+    # previously used in Render setup instructions.
+    api_id_raw = (os.getenv("TELEGRAM_API_ID") or os.getenv("API_ID") or "").strip()
+    api_hash = (os.getenv("TELEGRAM_API_HASH") or os.getenv("API_HASH") or "").strip()
+    session_string = (
+        os.getenv("TELEGRAM_SESSION_STRING")
+        or os.getenv("SESSION_STRING")
+        or ""
+    ).strip()
     if api_id_raw and api_hash and session_string:
         from pyrogram import Client
         from pytgcalls import PyTgCalls
