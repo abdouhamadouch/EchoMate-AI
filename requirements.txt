@@ -3,7 +3,7 @@ uvicorn[standard]>=0.30,<1
 yt-dlp>=2025.1.15
 httpx>=0.27,<1
 pydantic>=2.8,<3
-pyrogram>=2.0.106,<3
+pyrofork==2.3.69
 tgcrypto>=1.2.5
-py-tgcalls>=2.2.0,<2.3
+py-tgcalls==2.2.11
 python-multipart>=0.0.9
